@@ -3,6 +3,7 @@ import json
 import multiprocessing
 import tempfile
 import time
+import os
 
 import pytest
 import requests
@@ -13,6 +14,47 @@ from vllm.utils import FlexibleArgumentParser
 
 from .benchmark_utils import (ACCURACY_TASKS, PERFORMANCE_TASKS, VLLM_CONFIGS,
                               update_benchmark_summary)
+
+
+# Set multiprocessing start method to 'spawn' for FlashInfer compatibility
+if multiprocessing.get_start_method() != 'spawn':
+    multiprocessing.set_start_method('spawn', force=True)
+
+# Ensure V1 engine is used
+os.environ['VLLM_USE_V1'] = '1'
+
+
+def _run_lm_eval_process(task_config, model_name, tmpdir, queue):
+    """Run lm_eval in a separate process for accuracy benchmarks."""
+    try:
+        from lm_eval import evaluator
+        from lm_eval.utils import handle_non_serializable, make_table
+
+        result = evaluator.simple_evaluate(
+            model="local-completions",
+            model_args={
+                "model": model_name,
+                "base_url": "http://localhost:8000/v1/completions",
+                "num_concurrent": 256,
+            },
+            **task_config,
+        )
+        print(make_table(result))
+
+        tmpfile = f"{tmpdir}/result.json"
+        with open(tmpfile, "w") as f:
+            json.dump(result, f, indent=4, default=handle_non_serializable)
+        
+        # Send back the temporary file path
+        queue.put(tmpfile)
+    except Exception as exc:
+        # If an exception occurs, put it in the queue to be raised later
+        queue.put(exc)
+
+
+def _run_vllm_server(args):
+    """Run vLLM server in a separate process."""
+    uvloop.run(run_server(args))
 
 
 @pytest.fixture(scope="module", params=list(VLLM_CONFIGS.keys()))
@@ -30,13 +72,15 @@ def vllm_server(request):
     for key, value in VLLM_CONFIGS[request.param].items():
         setattr(args, key, value)
 
+    # Set environment variable for attention backend if specified
+    if args.attention_backend:
+        os.environ['VLLM_ATTENTION_BACKEND'] = args.attention_backend
+        print(f"Set VLLM_ATTENTION_BACKEND to {args.attention_backend}")
+
     validate_parsed_serve_args(args)
 
-    def _run_process():
-        uvloop.run(run_server(args))
-
     # Start server process
-    process = multiprocessing.Process(target=_run_process)
+    process = multiprocessing.Process(target=_run_vllm_server, args=(args,))
     process.start()
 
     print("Waiting for server to start...")
@@ -65,6 +109,11 @@ def vllm_server(request):
         process.terminate()
         process.join()
     print("Server process terminated")
+
+    # Clean up environment variable
+    if args.attention_backend:
+        if 'VLLM_ATTENTION_BACKEND' in os.environ:
+            del os.environ['VLLM_ATTENTION_BACKEND']
 
 
 @pytest.mark.parametrize("task_name", list(PERFORMANCE_TASKS.keys()))
@@ -116,37 +165,11 @@ def test_accuracy(request, vllm_server, task_name):
 
     q = multiprocessing.Queue()
 
-    def _run_process():
-        # Run lm_eval in a separate process because it imports torch and
-        # initializes CUDA, which breaks process forking in later tests.
-        try:
-            from lm_eval import evaluator
-            from lm_eval.utils import handle_non_serializable, make_table
-
-            result = evaluator.simple_evaluate(
-                model="local-completions",
-                model_args={
-                    "model": vllm_args.model,
-                    "base_url": "http://localhost:8000/v1/completions",
-                    "num_concurrent": 256,
-                },
-                **task.config,
-            )
-            print(make_table(result))
-
-            tmpfile = f"{tmpdir}/result.json"
-            with open(tmpfile, "w") as f:
-                json.dump(result, f, indent=4, default=handle_non_serializable)
-        except Exception as exc:
-            # If an exception occurs, put it in the queue to be raised later
-            q.put(exc)
-        else:
-            # Send back the temporary file path instead of the result object
-            # since multiprocessing queue can hang on large objects.
-            q.put(tmpfile)
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        process = multiprocessing.Process(target=_run_process)
+        process = multiprocessing.Process(
+            target=_run_lm_eval_process,
+            args=(task.config, vllm_args.model, tmpdir, q)
+        )
         process.start()
         r = q.get()
         process.join()

@@ -68,10 +68,10 @@ def get_attn_metadata_for_swiftkv():
 
 
 def is_flashinfer_backend(attn_metadata):
-    # Check if the current attention backend is FlashInfer
-    if not FLASHINFER_AVAILABLE:
+    if attn_metadata is None:
         return False
-    return isinstance(attn_metadata, FlashInferMetadata)
+    metadata_class_name = attn_metadata.__class__.__name__
+    return "FlashInfer" in metadata_class_name
 
 
 class LlamaSwiftKVAttention(LlamaAttention):
@@ -338,8 +338,10 @@ class LlamaSwiftKVModel(nn.Module):
         lora_config = vllm_config.lora_config
         
         # Detect attention backend for logging
-        attention_backend = getattr(vllm_config, 'attention_backend', 'unknown')
-        logger.info(f"SwiftKV initialized with attention backend: {attention_backend}")
+        # Check environment variable first
+        import os
+        attention_backend_env = os.getenv("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+        logger.info(f"SwiftKV initialized with attention backend: {attention_backend_env}")
 
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -438,82 +440,75 @@ class LlamaSwiftKVModel(nn.Module):
         if not torch.all(torch.diff(logits_indices) >= 0):
             logits_indices = torch.sort(logits_indices)[0]
 
-        # Update slot_mapping
-        if attn_metadata.slot_mapping is not None:
-            attn_metadata.slot_mapping = attn_metadata.slot_mapping[logits_indices]
+        try:
+            # Create new tensors instead of modifying existing ones to avoid memory corruption
+            batch_size = logits_indices.numel()
+            device = logits_indices.device
+            
+            # Update num_actual_tokens
+            if hasattr(attn_metadata, 'num_actual_tokens'):
+                attn_metadata.num_actual_tokens = batch_size
+            
+            # Update slot_mapping - create a new tensor
+            if attn_metadata.slot_mapping is not None:
+                new_slot_mapping = attn_metadata.slot_mapping[logits_indices].clone()
+                attn_metadata.slot_mapping = new_slot_mapping
 
-        if attn_metadata.query_start_loc is not None:
-            attn_metadata.query_start_loc = torch.searchsorted(
-                logits_indices, attn_metadata.query_start_loc, out_int32=True
-            )
+            # Handle qo_indptr and paged kv cache metadata
+            if hasattr(attn_metadata, 'qo_indptr') and attn_metadata.qo_indptr is not None:
+                new_qo_indptr = torch.searchsorted(
+                    logits_indices, attn_metadata.qo_indptr.to(logits_indices.device), out_int32=True
+                )
+                
+                req_keep_mask = torch.diff(new_qo_indptr) > 0
+                
+                # Update qo_indptr
+                attn_metadata.qo_indptr = new_qo_indptr[torch.cat([torch.tensor([True], device=device), req_keep_mask])]
+                
+                # Update paged KV cache metadata for SwiftKV based on which requests are kept.
+                if hasattr(attn_metadata, 'paged_kv_indptr') and attn_metadata.paged_kv_indptr is not None:
+                    if hasattr(attn_metadata, 'paged_kv_last_page_len') and attn_metadata.paged_kv_last_page_len is not None:
+                        if attn_metadata.paged_kv_last_page_len.shape[0] == req_keep_mask.shape[0]:
+                            attn_metadata.paged_kv_last_page_len = attn_metadata.paged_kv_last_page_len[req_keep_mask]
+                    
+                    if hasattr(attn_metadata, 'paged_kv_indices') and attn_metadata.paged_kv_indices is not None:
+                        page_counts = torch.diff(attn_metadata.paged_kv_indptr)
+                        if page_counts.shape[0] == req_keep_mask.shape[0]:
+                            kept_page_counts = page_counts[req_keep_mask]
+                            
+                            indices_to_keep = torch.repeat_interleave(req_keep_mask, page_counts)
+                            attn_metadata.paged_kv_indices = attn_metadata.paged_kv_indices[indices_to_keep]
 
-        # Handle qo_indptr
-        if attn_metadata.qo_indptr is not None:
-            batch_size = len(logits_indices)
-            device = attn_metadata.qo_indptr.device
-            dtype = attn_metadata.qo_indptr.dtype
+                            new_paged_kv_indptr = torch.zeros(kept_page_counts.numel() + 1, dtype=attn_metadata.paged_kv_indptr.dtype, device=device)
+                            torch.cumsum(kept_page_counts, dim=0, out=new_paged_kv_indptr[1:])
+                            attn_metadata.paged_kv_indptr = new_paged_kv_indptr
+                
+                # Update prefill/decode split metadata for SwiftKV.
+                num_kept_reqs = req_keep_mask.sum().item()
+                if hasattr(attn_metadata, 'num_decodes'):
+                    attn_metadata.num_decodes = num_kept_reqs
+                if hasattr(attn_metadata, 'num_decode_tokens'):
+                    attn_metadata.num_decode_tokens = batch_size
+                if hasattr(attn_metadata, 'num_prefills'):
+                    attn_metadata.num_prefills = 0
+                if hasattr(attn_metadata, 'num_prefill_tokens'):
+                    attn_metadata.num_prefill_tokens = 0
 
-            attn_metadata.qo_indptr = torch.arange(
-                batch_size + 1, dtype=dtype, device=device
-            )
+            # Disable cascade attention
+            if hasattr(attn_metadata, 'use_cascade'):
+                attn_metadata.use_cascade = False
+            if hasattr(attn_metadata, 'shared_qo_indptr'):
+                attn_metadata.shared_qo_indptr = None
+            if hasattr(attn_metadata, 'shared_kv_page_indptr'):
+                attn_metadata.shared_kv_page_indptr = None
+            if hasattr(attn_metadata, 'shared_kv_page_indices'):
+                attn_metadata.shared_kv_page_indices = None
+            if hasattr(attn_metadata, 'shared_kv_last_page_len'):
+                attn_metadata.shared_kv_last_page_len = None
 
-        # Handle paged KV cache metadata
-        if attn_metadata.paged_kv_indptr is not None:
-            self._update_paged_kv_metadata_for_swiftkv(attn_metadata, logits_indices)
-
-        # Disable cascade attention
-        attn_metadata.use_cascade = False
-        attn_metadata.shared_qo_indptr = None
-        attn_metadata.shared_kv_page_indptr = None
-        attn_metadata.shared_kv_page_indices = None
-        attn_metadata.shared_kv_last_page_len = None
-
-        self._update_prefill_decode_metadata_for_swiftkv(attn_metadata, logits_indices)
-
-    def _update_paged_kv_metadata_for_swiftkv(
-        self, attn_metadata, logits_indices: torch.Tensor
-    ):
-        # Update paged KV cache metadata for SwiftKV.
-        batch_size = len(logits_indices)
-
-        # similar to qo_indptr
-        if attn_metadata.paged_kv_indptr is not None:
-            device = attn_metadata.paged_kv_indptr.device
-            dtype = attn_metadata.paged_kv_indptr.dtype
-            attn_metadata.paged_kv_indptr = torch.arange(
-                batch_size + 1, dtype=dtype, device=device
-            )
-
-        # page indices for the remaining tokens
-        if attn_metadata.paged_kv_indices is not None:
-            device = attn_metadata.paged_kv_indices.device
-            dtype = attn_metadata.paged_kv_indices.dtype
-            attn_metadata.paged_kv_indices = torch.arange(
-                batch_size, dtype=dtype, device=device
-            )
-
-        # last page for each request
-        if attn_metadata.paged_kv_last_page_len is not None:
-            device = attn_metadata.paged_kv_last_page_len.device
-            dtype = attn_metadata.paged_kv_last_page_len.dtype
-            attn_metadata.paged_kv_last_page_len = torch.ones(
-                batch_size, dtype=dtype, device=device
-            )
-
-    def _update_prefill_decode_metadata_for_swiftkv(
-        self, attn_metadata, logits_indices: torch.Tensor
-    ):
-        # Update prefill/decode split metadata for SwiftKV.
-        batch_size = len(logits_indices)
-
-        if hasattr(attn_metadata, 'num_decodes'):
-            attn_metadata.num_decodes = batch_size
-        if hasattr(attn_metadata, 'num_decode_tokens'):
-            attn_metadata.num_decode_tokens = batch_size
-        if hasattr(attn_metadata, 'num_prefills'):
-            attn_metadata.num_prefills = 0
-        if hasattr(attn_metadata, 'num_prefill_tokens'):
-            attn_metadata.num_prefill_tokens = 0
+        except Exception as e:
+            logger.error(f"SwiftKV: Error updating FlashInfer metadata: {e}")
+            raise
 
     def swiftkv_select(
         self,
@@ -540,6 +535,12 @@ class LlamaSwiftKVModel(nn.Module):
                         inputs["k_states"][:padded_size],
                         inputs["v_states"][:padded_size])
             return hidden_states, residual, positions, k_states, v_states
+
+        # Re-enable SwiftKV for FlashInfer with improved metadata handling
+        is_flashinfer = is_flashinfer_backend(attn_metadata)
+        if is_flashinfer:
+            logger.info("SwiftKV: Re-enabled for FlashInfer backend with improved metadata handling")
+            # Continue with SwiftKV processing for FlashInfer
 
         if self.use_custom_ops:
             key_caches : List[torch.Tensor] = []
@@ -588,10 +589,20 @@ class LlamaSwiftKVModel(nn.Module):
 
         logits_indices = attn_metadata.swiftkv_logits_indices
 
-        if is_flashinfer_backend(attn_metadata):
-            attn_metadata.num_actual_tokens = logits_indices.numel()
-            self._update_flashinfer_metadata(attn_metadata, logits_indices)
+        # Detect backend and update metadata accordingly
+        is_flashinfer = is_flashinfer_backend(attn_metadata)
+        logger.debug(f"SwiftKV: Detected backend - FlashInfer: {is_flashinfer}")
+        
+        if is_flashinfer:
+            logger.info(f"SwiftKV: Processing FlashInfer with {logits_indices.numel()} tokens")
+            try:
+                self._update_flashinfer_metadata(attn_metadata, logits_indices)
+                logger.info("SwiftKV: Successfully updated FlashInfer metadata")
+            except Exception as e:
+                logger.error(f"SwiftKV: Error updating FlashInfer metadata: {e}")
+                raise
         else:
+            # FlashAttention backend
             attn_metadata.num_actual_tokens = logits_indices.numel()
             attn_metadata.query_start_loc = torch.searchsorted(
                 logits_indices, attn_metadata.query_start_loc, out_int32=True)
@@ -602,6 +613,7 @@ class LlamaSwiftKVModel(nn.Module):
                 attn_metadata.cu_prefix_query_lens = None
                 attn_metadata.prefix_kv_lens = None
                 attn_metadata.suffix_kv_lens = None
+            logger.debug("SwiftKV: Updated FlashAttention metadata")
 
         def index_fn(buffer_name: str, tensor: torch.Tensor,
                      indices: torch.LongTensor) -> torch.Tensor:

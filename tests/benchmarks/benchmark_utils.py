@@ -67,6 +67,18 @@ VLLM_CONFIGS = {
         },
         "enable_prefix_caching": False,
     },
+    "llama_8b_swiftkv_1gpu_flashattn": {
+        "model": "Snowflake/Llama-3.1-SwiftKV-8B-Instruct-FP8",
+        "tensor_parallel_size": 1,
+        "enable_prefix_caching": False,
+        "attention_backend": "FLASH_ATTN",
+    },
+    "llama_8b_swiftkv_1gpu_flashinfer": {
+        "model": "Snowflake/Llama-3.1-SwiftKV-8B-Instruct-FP8",
+        "tensor_parallel_size": 1,
+        "enable_prefix_caching": False,
+        "attention_backend": "FLASHINFER",
+    }
 }
 
 PERFORMANCE_TASKS = {

@@ -1,0 +1,25 @@
+{
+    "batch": {
+        "throughput": {
+            "llama_8b_swiftkv_1gpu_flashinfer": 12837.98612663126
+        }
+    },
+    "single": {
+        "ttft_ms": {
+            "llama_8b_swiftkv_1gpu_flashinfer": 125.12653301237151
+        },
+        "tpot_ms": {
+            "llama_8b_swiftkv_1gpu_flashinfer": 9.570997535582094
+        }
+    },
+    "arc_challenge": {
+        "acc": {
+            "llama_8b_swiftkv_1gpu_flashinfer": 0.012798634812286689
+        }
+    },
+    "gsm8k": {
+        "acc": {
+            "llama_8b_swiftkv_1gpu_flashinfer": 0.006823351023502654
+        }
+    }
+}
