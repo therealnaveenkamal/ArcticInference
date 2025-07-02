@@ -434,7 +434,7 @@ class LlamaSwiftKVModel(nn.Module):
         k_states: torch.Tensor,
         v_states: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                torch.Tensor]:
+               torch.Tensor]:
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = get_attn_metadata_for_swiftkv()
         if attn_metadata is None:
@@ -451,10 +451,10 @@ class LlamaSwiftKVModel(nn.Module):
             return hidden_states, residual, positions, k_states, v_states
 
         if self.use_custom_ops:
-            key_caches : List[torch.Tensor] = []
-            value_caches : List[torch.Tensor] = []
-            k_scales : List[torch.Tensor] = []
-            v_scales : List[torch.Tensor] = []
+            key_caches: List[torch.Tensor] = []
+            value_caches: List[torch.Tensor] = []
+            k_scales: List[torch.Tensor] = []
+            v_scales: List[torch.Tensor] = []
             num_heads = self.layers[-1].self_attn.attn.num_kv_heads
             head_size = self.layers[-1].self_attn.attn.head_size
             for idx, layer in enumerate(
@@ -470,8 +470,9 @@ class LlamaSwiftKVModel(nn.Module):
             if len(key_caches) > 0:
                 from arctic_inference.py_custom_ops import reshape_and_cache_flash_bulk
                 reshape_and_cache_flash_bulk(
-                    k_states, v_states, key_caches, value_caches, attn_metadata.slot_mapping,
-                    attn.kv_cache_dtype, k_scales, v_scales, num_heads, head_size)
+                    k_states, v_states, key_caches, value_caches,
+                    attn_metadata.slot_mapping, attn.kv_cache_dtype, k_scales,
+                    v_scales, num_heads, head_size)
         else:
             num_layers = (self.config.num_hidden_layers -
                           self.config.num_key_value_layers)
@@ -485,8 +486,10 @@ class LlamaSwiftKVModel(nn.Module):
                 kv_cache = attn.kv_cache[forward_context.virtual_engine]
                 if kv_cache.numel():
                     torch.ops._C_cache_ops.reshape_and_cache_flash(
-                        k_split[idx].view(-1, attn.num_kv_heads, attn.head_size),
-                        v_split[idx].view(-1, attn.num_kv_heads, attn.head_size),
+                        k_split[idx].view(-1, attn.num_kv_heads,
+                                         attn.head_size),
+                        v_split[idx].view(-1, attn.num_kv_heads,
+                                         attn.head_size),
                         kv_cache[0],
                         kv_cache[1],
                         attn_metadata.slot_mapping,
@@ -499,46 +502,61 @@ class LlamaSwiftKVModel(nn.Module):
         num_surviving_tokens = logits_indices.numel()
 
         if is_flashinfer_backend(attn_metadata):
-            # 1. using original request structure directly from the metadata.
+            # 1. Find which requests survived and their new token counts.
             original_num_tokens = attn_metadata.qo_indptr[-1].item()
             token_to_req_id = torch.searchsorted(
                 attn_metadata.qo_indptr,
-                torch.arange(original_num_tokens, device=logits_indices.device),
-                right=True
-            ) - 1
-            
-            # 2. id surviving requests and count tokens per request.
+                torch.arange(original_num_tokens,
+                             device=logits_indices.device),
+                right=True) - 1
             surviving_tokens_flat_req_ids = token_to_req_id[logits_indices]
             surviving_req_ids, surviving_tokens_per_req = torch.unique(
-                surviving_tokens_flat_req_ids, return_counts=True
-            )
+                surviving_tokens_flat_req_ids, return_counts=True)
             new_num_reqs = surviving_req_ids.numel()
 
-            # 3. rebuild metadata
+            # 2. Rebuild qo_indptr for surviving requests.
             attn_metadata.qo_indptr = torch.nn.functional.pad(
-                torch.cumsum(surviving_tokens_per_req, dim=0), (1, 0)
-            )
+                torch.cumsum(surviving_tokens_per_req, dim=0), (1, 0))
 
-            # 4. create a new paged_kv_indices containing only the pages for the surviving requests.
-            page_indices_start = attn_metadata.paged_kv_indptr[surviving_req_ids]
-            page_indices_end = attn_metadata.paged_kv_indptr[surviving_req_ids + 1]
-
-            new_paged_kv_indices_list = []
-            for i in range(new_num_reqs):
-                start, end = page_indices_start[i], page_indices_end[i]
-                new_paged_kv_indices_list.append(attn_metadata.paged_kv_indices[start:end])
-            
-            attn_metadata.paged_kv_indices = torch.cat(new_paged_kv_indices_list)
-
+            # 3. Rebuild paged KV cache metadata for surviving requests.
+            # This logic correctly filters pages for surviving requests.
             original_num_pages_per_req = attn_metadata.paged_kv_indptr.diff()
-            new_num_pages_per_req = original_num_pages_per_req[surviving_req_ids]
+            new_num_pages_per_req = original_num_pages_per_req[
+                surviving_req_ids]
+            page_indices_start = attn_metadata.paged_kv_indptr[
+                surviving_req_ids]
+            page_indices_end = attn_metadata.paged_kv_indptr[
+                surviving_req_ids + 1]
+
+            if new_num_reqs > 0:
+                # Efficiently create a mask for pages to keep
+                pages_mask = torch.zeros_like(attn_metadata.paged_kv_indices,
+                                              dtype=torch.bool)
+                # Create ranges for all surviving requests at once
+                ranges = torch.arange(
+                    page_indices_end.max(),
+                    device=pages_mask.device).unsqueeze(0)
+                # Create masks for each request's pages
+                start_masks = ranges >= page_indices_start.unsqueeze(1)
+                end_masks = ranges < page_indices_end.unsqueeze(1)
+                # Combine masks and sum over requests to get the final mask
+                pages_mask = (start_masks & end_masks).any(dim=0)
+                attn_metadata.paged_kv_indices = attn_metadata.paged_kv_indices.masked_select(
+                    pages_mask)
+            else:
+                attn_metadata.paged_kv_indices = torch.empty(
+                    0,
+                    dtype=attn_metadata.paged_kv_indices.dtype,
+                    device=attn_metadata.paged_kv_indices.device)
+
             attn_metadata.paged_kv_indptr = torch.nn.functional.pad(
-                torch.cumsum(new_num_pages_per_req, dim=0), (1, 0)
-            ).int()
-            
-            attn_metadata.paged_kv_last_page_len = attn_metadata.paged_kv_last_page_len[surviving_req_ids]
-            
-            attn_metadata.slot_mapping = attn_metadata.slot_mapping[logits_indices]
+                torch.cumsum(new_num_pages_per_req, dim=0), (1, 0)).int()
+            attn_metadata.paged_kv_last_page_len = attn_metadata.paged_kv_last_page_len[
+                surviving_req_ids]
+
+            # 4. Update other metadata fields.
+            attn_metadata.slot_mapping = attn_metadata.slot_mapping[
+                logits_indices]
             attn_metadata.num_actual_tokens = num_surviving_tokens
             attn_metadata.num_decodes = new_num_reqs
             attn_metadata.num_prefills = 0
@@ -546,19 +564,19 @@ class LlamaSwiftKVModel(nn.Module):
             attn_metadata.num_prefill_tokens = 0
             attn_metadata.use_cascade = False
 
-            # 5. replan the FlashInfer wrapper.
+            # 5. Re-plan the FlashInfer attention wrapper with new metadata.
             if attn_metadata.decode_wrapper and new_num_reqs > 0:
                 impl = self.layers[-1].self_attn.attn.impl
                 attn_metadata.decode_wrapper.plan(
                     attn_metadata.paged_kv_indptr,
-                    attn_metadata.paged_kv_indices, # unfiltered, as indptr handles it
+                    attn_metadata.paged_kv_indices,
                     attn_metadata.paged_kv_last_page_len,
                     attn_metadata.num_qo_heads,
                     attn_metadata.num_kv_heads,
                     attn_metadata.head_dim,
                     attn_metadata.page_size,
                     pos_encoding_mode="NONE",
-                    sm_scale=impl.scale, # get scale from the layer's implementation
+                    sm_scale=impl.scale,
                     window_left=impl.sliding_window[0],
                     logits_soft_cap=impl.logits_soft_cap or 0.0,
                     q_data_type=attn_metadata.q_data_type,
@@ -566,22 +584,25 @@ class LlamaSwiftKVModel(nn.Module):
                 )
             else:
                 attn_metadata.decode_wrapper = None
-            
             attn_metadata.prefill_wrapper = None
-
         else:
+            # This is the FlashAttention path
             attn_metadata.num_actual_tokens = num_surviving_tokens
             attn_metadata.query_start_loc = torch.searchsorted(
                 logits_indices, attn_metadata.query_start_loc, out_int32=True)
-            attn_metadata.slot_mapping = attn_metadata.slot_mapping[logits_indices]
+            attn_metadata.slot_mapping = attn_metadata.slot_mapping[
+                logits_indices]
             attn_metadata.use_cascade = False
 
         def index_fn(buffer_name: str, tensor: torch.Tensor,
-                    indices: torch.LongTensor) -> torch.Tensor:
+                     indices: torch.LongTensor) -> torch.Tensor:
             batch_size = indices.numel()
             if batch_size > 0 and batch_size <= self.cuda_graph_max_batch_size:
                 buffer = self.decode_runner.inputs[buffer_name]
-                torch.index_select(tensor, 0, indices, out=buffer[:batch_size])
+                torch.index_select(tensor,
+                                   0,
+                                   indices,
+                                   out=buffer[:batch_size])
                 padded_size = self.vllm_config.pad_for_cudagraph(batch_size)
                 return buffer[:padded_size]
             return tensor.index_select(0, indices)

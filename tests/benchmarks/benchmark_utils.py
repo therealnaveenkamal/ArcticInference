@@ -33,6 +33,12 @@ VLLM_CONFIGS = {
         "tensor_parallel_size": 4,
         "enable_prefix_caching": False,
     },
+    "llama_8b_swiftkv_flashinfer": {
+        "model": "Snowflake/Llama-3.1-SwiftKV-8B-Instruct-FP8",
+        "tensor_parallel_size": 1,
+        "enable_prefix_caching": False,
+        "attention_backend": "FLASHINFER",
+    },
     "llama_8b_suffix": {
         "model": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
         "tensor_parallel_size": 4,
@@ -129,31 +135,31 @@ ACCURACY_TASKS = {
             "acc": "exact_match,flexible-extract",
         },
     ),
-    "ifeval": BenchmarkTask(
-        config={
-            "tasks": ["ifeval"],
-            "apply_chat_template": True,
-        },
-        metrics={
-            "score": lambda result: (result["prompt_level_strict_acc,none"] +
-                                     result["inst_level_strict_acc,none"]) / 2,
-        },
-    ),
-    "mmlu_pro": BenchmarkTask(
-        config={
-            "tasks": ["mmlu_pro"],
-            "apply_chat_template": True,
-        },
-        metrics={
-            "acc": "exact_match,custom-extract",
-        },
-    ),
+    # "ifeval": BenchmarkTask(
+    #     config={
+    #         "tasks": ["ifeval"],
+    #         "apply_chat_template": True,
+    #     },
+    #     metrics={
+    #         "score": lambda result: (result["prompt_level_strict_acc,none"] +
+    #                                  result["inst_level_strict_acc,none"]) / 2,
+    #     },
+    # ),
+    # "mmlu_pro": BenchmarkTask(
+    #     config={
+    #         "tasks": ["mmlu_pro"],
+    #         "apply_chat_template": True,
+    #     },
+    #     metrics={
+    #         "acc": "exact_match,custom-extract",
+    #     },
+    # ),
 }
 
 
 def init_benchmark_summary():
     tuples = []
-    for name, task in {**PERFORMANCE_TASKS, **ACCURACY_TASKS}.items():
+    for name, task in {**ACCURACY_TASKS}.items():
         for metric in task.metrics:
             tuples.append((name, metric))
     columns = pd.MultiIndex.from_tuples(tuples, names=['task', 'metric'])
