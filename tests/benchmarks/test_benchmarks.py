@@ -14,6 +14,43 @@ from vllm.utils import FlexibleArgumentParser
 from .benchmark_utils import (ACCURACY_TASKS, PERFORMANCE_TASKS, VLLM_CONFIGS,
                               update_benchmark_summary)
 
+# Set multiprocessing start method to 'spawn' to avoid CUDA re-initialization issues
+# in forked subprocesses
+from contextlib import suppress
+with suppress(RuntimeError):
+    multiprocessing.set_start_method('spawn', force=True)
+
+
+def _run_vllm_server(args):
+    uvloop.run(run_server(args))
+
+
+def _run_lm_eval(model, base_url, task_config, tmpdir, q):
+    # running lm_eval in a separate process because it imports torch and
+    # initializes CUDA, which breaks process forking in later tests.
+    try:
+        from lm_eval import evaluator
+        from lm_eval.utils import handle_non_serializable, make_table
+
+        result = evaluator.simple_evaluate(
+            model="local-completions",
+            model_args={
+                "model": model,
+                "base_url": base_url,
+                "num_concurrent": 256,
+            },
+            **task_config,
+        )
+        print(make_table(result))
+
+        tmpfile = f"{tmpdir}/result.json"
+        with open(tmpfile, "w") as f:
+            json.dump(result, f, indent=4, default=handle_non_serializable)
+    except Exception as exc:
+        q.put(exc)
+    else:
+        q.put(tmpfile)
+
 
 @pytest.fixture(scope="module", params=list(VLLM_CONFIGS.keys()))
 def vllm_server(request):
@@ -28,15 +65,16 @@ def vllm_server(request):
     args.disable_uvicorn_access_log = True
 
     for key, value in VLLM_CONFIGS[request.param].items():
-        setattr(args, key, value)
+        if key == "attention_backend":
+            import os
+            os.environ["VLLM_ATTENTION_BACKEND"] = value
+        else:
+            setattr(args, key, value)
 
     validate_parsed_serve_args(args)
 
-    def _run_process():
-        uvloop.run(run_server(args))
-
     # Start server process
-    process = multiprocessing.Process(target=_run_process)
+    process = multiprocessing.Process(target=_run_vllm_server, args=(args,))
     process.start()
 
     print("Waiting for server to start...")
@@ -116,37 +154,11 @@ def test_accuracy(request, vllm_server, task_name):
 
     q = multiprocessing.Queue()
 
-    def _run_process():
-        # Run lm_eval in a separate process because it imports torch and
-        # initializes CUDA, which breaks process forking in later tests.
-        try:
-            from lm_eval import evaluator
-            from lm_eval.utils import handle_non_serializable, make_table
-
-            result = evaluator.simple_evaluate(
-                model="local-completions",
-                model_args={
-                    "model": vllm_args.model,
-                    "base_url": "http://localhost:8000/v1/completions",
-                    "num_concurrent": 256,
-                },
-                **task.config,
-            )
-            print(make_table(result))
-
-            tmpfile = f"{tmpdir}/result.json"
-            with open(tmpfile, "w") as f:
-                json.dump(result, f, indent=4, default=handle_non_serializable)
-        except Exception as exc:
-            # If an exception occurs, put it in the queue to be raised later
-            q.put(exc)
-        else:
-            # Send back the temporary file path instead of the result object
-            # since multiprocessing queue can hang on large objects.
-            q.put(tmpfile)
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        process = multiprocessing.Process(target=_run_process)
+        process = multiprocessing.Process(
+            target=_run_lm_eval,
+            args=(vllm_args.model, "http://localhost:8000/v1/completions", task.config, tmpdir, q)
+        )
         process.start()
         r = q.get()
         process.join()

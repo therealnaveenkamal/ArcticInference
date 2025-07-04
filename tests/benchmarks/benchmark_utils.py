@@ -30,8 +30,14 @@ VLLM_CONFIGS = {
     },
     "llama_8b_swiftkv": {
         "model": "Snowflake/Llama-3.1-SwiftKV-8B-Instruct-FP8",
+        "tensor_parallel_size": 1,
+        "enable_prefix_caching": False,
+    },
+    "llama_8b_swiftkv_flashinfer": {
+        "model": "Snowflake/Llama-3.1-SwiftKV-8B-Instruct-FP8",
         "tensor_parallel_size": 4,
         "enable_prefix_caching": False,
+        "attention_backend": "FLASHINFER",
     },
     "llama_8b_suffix": {
         "model": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic",
