@@ -111,42 +111,42 @@ def vllm_server(request):
     print("Server process terminated")
 
 
-# @pytest.mark.parametrize("task_name", list(PERFORMANCE_TASKS.keys()))
-# def test_performance(request, vllm_server, task_name):
-#     from vllm.benchmarks.serve import add_cli_args, main
+@pytest.mark.parametrize("task_name", list(PERFORMANCE_TASKS.keys()))
+def test_performance(request, vllm_server, task_name):
+    from vllm.benchmarks.serve import add_cli_args, main
 
-#     config_name, vllm_args = vllm_server
-#     task = PERFORMANCE_TASKS[task_name]
+    config_name, vllm_args = vllm_server
+    task = PERFORMANCE_TASKS[task_name]
 
-#     parser = argparse.ArgumentParser()
-#     add_cli_args(parser)
+    parser = argparse.ArgumentParser()
+    add_cli_args(parser)
 
-#     args = parser.parse_args(["--model", vllm_args.model])
+    args = parser.parse_args(["--model", vllm_args.model])
 
-#     with tempfile.TemporaryDirectory() as tmpdir:
-#         args.save_result = True
-#         args.result_dir = str(tmpdir)
-#         args.result_filename = "result.json"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        args.save_result = True
+        args.result_dir = str(tmpdir)
+        args.result_filename = "result.json"
 
-#         for key, value in task.config.items():
-#             setattr(args, key, value)
+        for key, value in task.config.items():
+            setattr(args, key, value)
 
-#         main(args)
+        main(args)
 
-#         with open(f"{tmpdir}/result.json", "r") as f:
-#             result = json.load(f)
+        with open(f"{tmpdir}/result.json", "r") as f:
+            result = json.load(f)
 
-#     benchmark_result_dir = request.config.option.benchmark_result_dir
-#     if benchmark_result_dir is not None:
-#         result_path = (benchmark_result_dir / "performance" /
-#                        f"{config_name}-{task_name}.json")
-#         result_path.parent.mkdir(parents=True, exist_ok=True)
-#         with open(result_path, "w") as f:
-#             json.dump(result, f, indent=4)
+    benchmark_result_dir = request.config.option.benchmark_result_dir
+    if benchmark_result_dir is not None:
+        result_path = (benchmark_result_dir / "performance" /
+                       f"{config_name}-{task_name}.json")
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, "w") as f:
+            json.dump(result, f, indent=4)
 
-#     metrics = {name: key(result) if callable(key) else result[key]
-#                for name, key in task.metrics.items()}
-#     update_benchmark_summary(config_name, task_name, metrics)
+    metrics = {name: key(result) if callable(key) else result[key]
+               for name, key in task.metrics.items()}
+    update_benchmark_summary(config_name, task_name, metrics)
 
 
 @pytest.mark.parametrize("task_name", list(ACCURACY_TASKS.keys()))
