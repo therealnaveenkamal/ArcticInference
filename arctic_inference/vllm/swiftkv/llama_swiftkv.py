@@ -427,7 +427,7 @@ class LlamaSwiftKVModel(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = get_attn_metadata_for_swiftkv()
         if attn_metadata is None:
-            # Graph capture mode logic is fine
+            # Graph capture or profiling mode.
             if hidden_states.shape[0] <= self.cuda_graph_max_batch_size:
                 # Return the preallocated buffers so cuda graph is captured
                 # correctly.
@@ -442,10 +442,10 @@ class LlamaSwiftKVModel(nn.Module):
             return hidden_states, residual, positions, k_states, v_states
 
         if self.use_custom_ops:
-            key_caches: List[torch.Tensor] = []
-            value_caches: List[torch.Tensor] = []
-            k_scales: List[torch.Tensor] = []
-            v_scales: List[torch.Tensor] = []
+            key_caches : List[torch.Tensor] = []
+            value_caches : List[torch.Tensor] = []
+            k_scales : List[torch.Tensor] = []
+            v_scales : List[torch.Tensor] = []
             num_heads = self.layers[-1].self_attn.attn.num_kv_heads
             head_size = self.layers[-1].self_attn.attn.head_size
             for idx, layer in enumerate(
@@ -650,9 +650,9 @@ class LlamaSwiftKVModel(nn.Module):
                 logits_indices, attn_metadata.query_start_loc, out_int32=True)
             attn_metadata.slot_mapping = attn_metadata.slot_mapping[
                 logits_indices]
+            
+            # TODO: Make cascade attention work with SwiftKV
             attn_metadata.use_cascade = False
-
-            # cascade attention fields
             attn_metadata.cu_prefix_query_lens = None
             attn_metadata.prefix_kv_lens = None
             attn_metadata.suffix_kv_lens = None
