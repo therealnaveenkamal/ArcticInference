@@ -515,18 +515,33 @@ class LlamaSwiftKVModel(nn.Module):
             surviving_req_ids, surviving_tokens_per_req = torch.unique(surviving_tokens_flat_req_ids, return_counts=True)
             new_num_reqs = surviving_req_ids.numel()
 
-            # 2. build qo_indptr for surviving requests.
-            attn_metadata.qo_indptr = torch.nn.functional.pad(
-                torch.cumsum(surviving_tokens_per_req, dim=0), (1, 0))
+            # 2. classify surviving requests as decode vs prefill
+            # decode: exactly 1 token, prefill: > 1 token
+            decode_mask = surviving_tokens_per_req == 1
+            prefill_mask = surviving_tokens_per_req > 1
+            
+            decode_req_ids = surviving_req_ids[decode_mask]
+            prefill_req_ids = surviving_req_ids[prefill_mask]
+            
+            new_num_decodes = decode_req_ids.numel()
+            new_num_prefills = prefill_req_ids.numel()
+            new_num_decode_tokens = decode_mask.sum().item()
+            new_num_prefill_tokens = prefill_mask.sum().item()
 
-            # 3. build paged KV cache metadata for surviving requests.
+            # 3. build qo_indptr for surviving requests (decode first, then prefill)
+            # Reorder surviving requests: decode first, then prefill
+            reordered_req_ids = torch.cat([decode_req_ids, prefill_req_ids])
+            reordered_tokens_per_req = torch.cat([
+                surviving_tokens_per_req[decode_mask],
+                surviving_tokens_per_req[prefill_mask]
+            ])
+            attn_metadata.qo_indptr = torch.nn.functional.pad(torch.cumsum(reordered_tokens_per_req, dim=0), (1, 0))
+
+            # 4. build paged KV cache metadata for surviving requests
             original_num_pages_per_req = attn_metadata.paged_kv_indptr.diff()
-            new_num_pages_per_req = original_num_pages_per_req[
-                surviving_req_ids]
-            page_indices_start = attn_metadata.paged_kv_indptr[
-                surviving_req_ids]
-            page_indices_end = attn_metadata.paged_kv_indptr[
-                surviving_req_ids + 1]
+            reordered_num_pages_per_req = original_num_pages_per_req[reordered_req_ids]
+            page_indices_start = attn_metadata.paged_kv_indptr[reordered_req_ids]
+            page_indices_end = attn_metadata.paged_kv_indptr[reordered_req_ids + 1]
 
             if new_num_reqs > 0:
                 # create page indices for each surviving request
@@ -545,19 +560,31 @@ class LlamaSwiftKVModel(nn.Module):
                     device=attn_metadata.paged_kv_indices.device)
 
             # build paged_kv_indptr for surviving requests
-            attn_metadata.paged_kv_indptr = torch.nn.functional.pad(
-                torch.cumsum(new_num_pages_per_req, dim=0), (1, 0)).int()
+            attn_metadata.paged_kv_indptr = torch.nn.functional.pad(torch.cumsum(reordered_num_pages_per_req, dim=0), (1, 0)).int()
             # update last page lengths for surviving requests
-            attn_metadata.paged_kv_last_page_len = attn_metadata.paged_kv_last_page_len[
-                surviving_req_ids]
+            attn_metadata.paged_kv_last_page_len = attn_metadata.paged_kv_last_page_len[reordered_req_ids]
 
-            # 4. update other metadata fields.
-            attn_metadata.slot_mapping = attn_metadata.slot_mapping[logits_indices]
+            # 5. create reordered logits_indices (decode tokens first, then prefill tokens)
+            # Map original req_ids to new positions
+            old_to_new_req_pos = torch.full((surviving_req_ids.max() + 1,), -1, 
+                                           dtype=torch.long, device=logits_indices.device)
+            old_to_new_req_pos[reordered_req_ids] = torch.arange(new_num_reqs, device=logits_indices.device)
+            
+            # Get new request positions for each surviving token
+            new_req_positions = old_to_new_req_pos[surviving_tokens_flat_req_ids]
+            
+            # Sort tokens by new request position to get decode tokens first, then prefill tokens
+            sorted_indices = torch.argsort(new_req_positions)
+            attn_metadata.swiftkv_inverse_sort_indices = torch.argsort(sorted_indices)
+            reordered_logits_indices = logits_indices[sorted_indices]
+
+            # 6. update other metadata fields
+            attn_metadata.slot_mapping = attn_metadata.slot_mapping[reordered_logits_indices]
             attn_metadata.num_actual_tokens = num_surviving_tokens
-            attn_metadata.num_decodes = new_num_reqs
-            attn_metadata.num_prefills = 0 # TODO: need to check for spec-dec
-            attn_metadata.num_decode_tokens = num_surviving_tokens
-            attn_metadata.num_prefill_tokens = 0 # TODO: need to check for spec-dec
+            attn_metadata.num_decodes = new_num_decodes
+            attn_metadata.num_prefills = new_num_prefills
+            attn_metadata.num_decode_tokens = new_num_decode_tokens
+            attn_metadata.num_prefill_tokens = new_num_prefill_tokens
             attn_metadata.use_cascade = False
 
             # cascade attention fields
@@ -567,13 +594,14 @@ class LlamaSwiftKVModel(nn.Module):
             attn_metadata.shared_kv_last_page_len = None
             attn_metadata.cascade_wrapper = None
 
-            # 5. re-plan the FlashInfer attention wrapper with new metadata.
-            if attn_metadata.decode_wrapper and new_num_reqs > 0:
-                impl = self.layers[-1].self_attn.attn.impl
+            # 7. re-plan the FlashInfer attention wrappers with new metadata
+            impl = self.layers[-1].self_attn.attn.impl
+            
+            if attn_metadata.decode_wrapper and new_num_decodes > 0:
                 attn_metadata.decode_wrapper.plan(
-                    attn_metadata.paged_kv_indptr,
+                    attn_metadata.paged_kv_indptr[:new_num_decodes + 1],
                     attn_metadata.paged_kv_indices,
-                    attn_metadata.paged_kv_last_page_len,
+                    attn_metadata.paged_kv_last_page_len[:new_num_decodes],
                     attn_metadata.num_qo_heads,
                     attn_metadata.num_kv_heads,
                     attn_metadata.head_dim,
@@ -584,10 +612,37 @@ class LlamaSwiftKVModel(nn.Module):
                     logits_soft_cap=impl.logits_soft_cap or 0.0,
                     q_data_type=attn_metadata.q_data_type,
                     kv_data_type=attn_metadata.data_type,
-                )
+                    )
             else:
                 attn_metadata.decode_wrapper = None
-            attn_metadata.prefill_wrapper = None
+            
+            # Plan prefill wrapper if we have prefill requests
+            if attn_metadata.prefill_wrapper and new_num_prefills > 0:
+                # Prefill starts after decode requests
+                prefill_start = new_num_decodes
+                qo_indptr_prefill = attn_metadata.qo_indptr[prefill_start:] - attn_metadata.qo_indptr[prefill_start]
+                attn_metadata.prefill_wrapper.plan(
+                    qo_indptr_prefill,
+                    attn_metadata.paged_kv_indptr[prefill_start:],
+                    attn_metadata.paged_kv_indices,
+                    attn_metadata.paged_kv_last_page_len[prefill_start:],
+                    attn_metadata.num_qo_heads,
+                    attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim,
+                    attn_metadata.page_size,
+                    causal=True,
+                    sm_scale=impl.scale,
+                    window_left=impl.sliding_window[0],
+                    logits_soft_cap=impl.logits_soft_cap or 0.0,
+                    q_data_type=attn_metadata.q_data_type,
+                    kv_data_type=attn_metadata.data_type,
+                )
+            else:
+                attn_metadata.prefill_wrapper = None
+            
+            # Use reordered indices for token selection
+            final_logits_indices = reordered_logits_indices
+
         else:
             # FlashAttention path
             attn_metadata.num_actual_tokens = num_surviving_tokens
@@ -615,11 +670,18 @@ class LlamaSwiftKVModel(nn.Module):
                 return buffer[:padded_size]
             return tensor.index_select(0, indices)
 
-        return (index_fn("hidden_states", hidden_states, logits_indices),
-                index_fn("residual", residual, logits_indices),
-                index_fn("positions", positions, logits_indices),
-                index_fn("k_states", k_states, logits_indices),
-                index_fn("v_states", v_states, logits_indices))
+        if isinstance(attn_metadata, FlashInferMetadata):
+            # For FlashInfer, use the reordered indices
+            selection_indices = final_logits_indices
+        else:
+            # For FlashAttention, no reordering needed
+            selection_indices = logits_indices
+
+        return (index_fn("hidden_states", hidden_states, selection_indices),
+                index_fn("residual", residual, selection_indices),
+                index_fn("positions", positions, selection_indices),
+                index_fn("k_states", k_states, selection_indices),
+                index_fn("v_states", v_states, selection_indices))
 
     def forward(
         self,
@@ -652,7 +714,12 @@ class LlamaSwiftKVModel(nn.Module):
         if attn_metadata is not None:
             logits_indices = attn_metadata.swiftkv_logits_indices
             batch_size = logits_indices.numel()
-            orig_hidden_states[logits_indices] = hidden_states[:batch_size]
+            
+            if isinstance(attn_metadata, FlashInferMetadata):
+                inverse_sort_indices = attn_metadata.swiftkv_inverse_sort_indices
+                orig_hidden_states[logits_indices] = hidden_states[inverse_sort_indices][:batch_size]
+            else:
+                orig_hidden_states[logits_indices] = hidden_states[:batch_size]
 
         return orig_hidden_states
 
