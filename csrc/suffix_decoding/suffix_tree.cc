@@ -21,6 +21,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <omp.h>
 #include "suffix_tree.h"
 
 #define CHECK_OR_RETURN(cond, msg) if (!(cond)) return msg;
@@ -527,3 +528,58 @@ size_t SuffixTree::estimate_memory() const {
     }
     return total;
 }
+
+// Incremental speculation starting from a known match state.
+// This avoids rescanning the pattern if we know where we matched last time.
+Candidate SuffixTree::speculate_from_match(Node* start_node, int start_idx,
+                                           const std::vector<int>& suffix_tokens,
+                                           int max_spec_tokens,
+                                           float max_spec_factor,
+                                           float max_spec_offset,
+                                           float min_token_prob,
+                                           bool use_tree_spec) {
+    Candidate result;
+
+    // Extend the pattern with suffix_tokens for matching
+    std::vector<int> extended_pattern;
+    extended_pattern.reserve(suffix_tokens.size());
+
+    Node* current_node = start_node;
+    int current_idx = start_idx;
+
+    // Apply suffix tokens to extend the match
+    for (int token : suffix_tokens) {
+        if (current_idx >= current_node->length) {
+            // Need to traverse to child
+            if (current_node->children.contains(token)) {
+                current_node = current_node->children[token].get();
+                current_idx = 0;
+            } else {
+                // No match found, return empty result
+                return result;
+            }
+        } else {
+            // Check if token matches current node
+            if (_seqs[current_node->ref_seq][current_node->ref_idx + current_idx] != token) {
+                return result; // Mismatch
+            }
+            current_idx++;
+        }
+    }
+
+    // Now speculate from the matched position
+    int match_len = static_cast<int>(suffix_tokens.size());
+    int max_tokens = std::min(max_spec_tokens,
+                              static_cast<int>(match_len * max_spec_factor + max_spec_offset + 1e-6));
+    max_tokens = std::max(max_tokens, 0);
+
+    if (use_tree_spec) {
+        result = _speculate_tree(current_node, current_idx, max_tokens, min_token_prob);
+    } else {
+        result = _speculate_path(current_node, current_idx, max_tokens, min_token_prob);
+    }
+    result.match_len = match_len;
+
+    return result;
+}
+

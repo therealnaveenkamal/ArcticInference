@@ -100,6 +100,16 @@ public:
                         float min_token_prob = 0.1f,
                         bool use_tree_spec = false);
 
+    // Incremental speculation starting from a known match state.
+    // This avoids rescanning the pattern if we know where we matched last time.
+    Candidate speculate_from_match(Node* start_node, int start_idx,
+                                   const std::vector<int>& suffix_tokens,
+                                   int max_spec_tokens,
+                                   float max_spec_factor = 1.0f,
+                                   float max_spec_offset = 0.0f,
+                                   float min_token_prob = 0.1f,
+                                   bool use_tree_spec = false);
+
     // Check the integrity of the suffix tree, return empty string if ok,
     // otherwise return an error message.
     std::string check_integrity();

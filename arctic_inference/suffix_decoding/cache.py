@@ -58,7 +58,8 @@ class SuffixDecodingCache:
     
     def __init__(self,
                  max_tree_depth: int = 64,
-                 max_cached_requests: int = -1):
+                 max_cached_requests: int = -1,
+                 enable_optimizations: bool = True):
         """
         Initialize the SuffixDecodingCache.
 
@@ -73,6 +74,7 @@ class SuffixDecodingCache:
 
         self._max_tree_depth = max_tree_depth
         self._max_cached_requests = max_cached_requests
+        self._enable_opts = enable_optimizations
 
         # Global suffix tree caches previous responses in a single tree.
         self._global_tree = SuffixTree(max_tree_depth)
@@ -87,6 +89,13 @@ class SuffixDecodingCache:
 
         # Unused sequence ID to assign to a new request ID.
         self._next_seq_id = 0
+
+        # Winner-stays heuristic: remember which tree won last for each request
+        self._winner_cache = {}  # req_id -> ('local' or 'global', step_count)
+        self._revalidation_steps = 8  # check other tree every N steps
+
+        # Incremental matching: cache match state per request to avoid rescanning
+        self._match_cache = {}  # req_id -> (tree_type, node_ptr, node_idx, pattern_len)
 
     @property
     def max_tree_depth(self) -> int:
@@ -162,6 +171,9 @@ class SuffixDecodingCache:
         if req_id not in self._local_trees:
             raise ValueError(f"Request '{req_id}' is not active")
         del self._local_trees[req_id]
+        # Clear winner and match caches for this request
+        self._winner_cache.pop(req_id, None)
+        self._match_cache.pop(req_id, None)
 
     def add_active_response(
         self,
@@ -259,26 +271,110 @@ class SuffixDecodingCache:
         if len(pattern) > self._max_tree_depth:
             pattern = pattern[-self._max_tree_depth :]
 
-        candidate = self._local_trees[req_id].speculate(
-            pattern,
-            max_spec_tokens,
-            max_spec_factor,
-            max_spec_offset,
-            min_token_prob,
-            use_tree_spec)
-        result = SuffixDecodingDraft.from_candidate(candidate)
+        if not self._enable_opts:
+            # Original behavior: evaluate local then global, choose max
+            candidate = self._local_trees[req_id].speculate(
+                pattern,
+                max_spec_tokens,
+                max_spec_factor,
+                max_spec_offset,
+                min_token_prob,
+                use_tree_spec)
+            result = SuffixDecodingDraft.from_candidate(candidate)
+            candidate = self._global_tree.speculate(
+                pattern,
+                max_spec_tokens,
+                max_spec_factor,
+                max_spec_offset,
+                min_token_prob,
+                use_tree_spec)
+            if candidate.score > result.score:
+                result = SuffixDecodingDraft.from_candidate(candidate)
+            return result
 
-        candidate = self._global_tree.speculate(
-            pattern,
-            max_spec_tokens,
-            max_spec_factor,
-            max_spec_offset,
-            min_token_prob,
-            use_tree_spec)
-        if candidate.score > result.score:
+        # Winner-stays heuristic: use cached winner or revalidate
+        winner, step_count = self._winner_cache.get(req_id, ('global', 0))
+        step_count += 1
+
+        # Try winner first with incremental matching
+        if winner == 'local':
+            tree = self._local_trees[req_id]
+            match_state = self._match_cache.get(req_id)
+
+            if match_state and match_state[0] == 'local':
+                # Use incremental matching if we have a cached state
+                tree_type, node_ptr, node_idx, prev_len = match_state
+                suffix_len = len(pattern) - prev_len
+                if suffix_len > 0:
+                    suffix_tokens = pattern[prev_len:]
+                    candidate = tree._tree.speculate_from_match(
+                        node_ptr, node_idx, suffix_tokens,
+                        max_spec_tokens, max_spec_factor, max_spec_offset,
+                        min_token_prob, use_tree_spec)
+                else:
+                    # No new tokens, use cached result
+                    candidate = tree._tree.speculate(
+                        pattern, max_spec_tokens, max_spec_factor, max_spec_offset,
+                        min_token_prob, use_tree_spec)
+            else:
+                # No cached state, do full speculation
+                candidate = tree.speculate(
+                    pattern, max_spec_tokens, max_spec_factor, max_spec_offset,
+                    min_token_prob, use_tree_spec)
+
             result = SuffixDecodingDraft.from_candidate(candidate)
 
+            # Revalidate against global if score is weak or periodically
+            if result.score < 0.5 or step_count >= self._revalidation_steps:
+                candidate = self._global_tree.speculate(
+                    pattern, max_spec_tokens, max_spec_factor, max_spec_offset,
+                    min_token_prob, use_tree_spec)
+                if candidate.score > result.score:
+                    result = SuffixDecodingDraft.from_candidate(candidate)
+                    winner = 'global'
+                step_count = 0
+        else:  # winner == 'global'
+            tree = self._global_tree
+            match_state = self._match_cache.get(req_id)
+
+            if match_state and match_state[0] == 'global':
+                # Use incremental matching if we have a cached state
+                tree_type, node_ptr, node_idx, prev_len = match_state
+                suffix_len = len(pattern) - prev_len
+                if suffix_len > 0:
+                    suffix_tokens = pattern[prev_len:]
+                    candidate = tree.speculate_from_match(
+                        node_ptr, node_idx, suffix_tokens,
+                        max_spec_tokens, max_spec_factor, max_spec_offset,
+                        min_token_prob, use_tree_spec)
+                else:
+                    # No new tokens, use cached result
+                    candidate = tree.speculate(
+                        pattern, max_spec_tokens, max_spec_factor, max_spec_offset,
+                        min_token_prob, use_tree_spec)
+            else:
+                # No cached state, do full speculation
+                candidate = tree.speculate(
+                    pattern, max_spec_tokens, max_spec_factor, max_spec_offset,
+                    min_token_prob, use_tree_spec)
+
+            result = SuffixDecodingDraft.from_candidate(candidate)
+
+            # Revalidate against local if score is weak or periodically
+            if result.score < 0.5 or step_count >= self._revalidation_steps:
+                candidate = self._local_trees[req_id].speculate(
+                    pattern, max_spec_tokens, max_spec_factor, max_spec_offset,
+                    min_token_prob, use_tree_spec)
+                if candidate.score > result.score:
+                    result = SuffixDecodingDraft.from_candidate(candidate)
+                    winner = 'local'
+                step_count = 0
+
+        # Update caches
+        self._winner_cache[req_id] = (winner, step_count)
+        # TODO: Update match cache with the current match state
         return result
+
 
     def _generate_seq_id(self, req_id: Hashable) -> int:
         # Find the next available seq_id not used by an active request.
